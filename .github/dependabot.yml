@@ -4,11 +4,26 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    ignore:
+      # The action ref intentionally doubles as the tested Rust toolchain.
+      # Dependabot interprets these channel-like refs as SemVer and can propose
+      # a toolchain that Rust has not released, such as 1.120.0.
+      - dependency-name: dtolnay/rust-toolchain
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Cargo.toml defines Rust 1.88 as the minimum supported version. Keeping
+      # the production builder aligned ensures every release honors that MSRV.
+      - dependency-name: rust
