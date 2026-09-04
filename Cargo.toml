@@ -22,7 +22,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sha1 = "0.10.7"
+sha1 = "0.11.0"
 sha2 = "0.10.9"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json", "macros"] }
 tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
