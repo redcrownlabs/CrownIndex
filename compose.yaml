@@ -1,0 +1,168 @@
+name: crown-index
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bitmagnet
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crownindex-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bitmagnet"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  bitmagnet:
+    image: ghcr.io/bitmagnet-io/bitmagnet:v0.10.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: bitmagnet
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crownindex-local}
+    command:
+      - worker
+      - run
+      - --keys=http_server
+      - --keys=queue_server
+      - --keys=dht_crawler
+    ports:
+      - "127.0.0.1:3333:3333"
+      - "3334:3334/tcp"
+      - "3334:3334/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --spider http://127.0.0.1:3333/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  jackett:
+    image: lscr.io/linuxserver/jackett:0.24.1957
+    restart: unless-stopped
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Etc/UTC}
+      AUTO_UPDATE: "false"
+    volumes:
+      - jackett-config:/config
+    ports:
+      - "127.0.0.1:9117:9117"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:9117/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.5.0
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${FLARESOLVERR_LOG_LEVEL:-info}
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      DISABLE_MEDIA: "true"
+      TZ: ${TZ:-Etc/UTC}
+    shm_size: 2g
+    ports:
+      - "127.0.0.1:8191:8191"
+
+  api:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitmagnet:
+        condition: service_healthy
+      jackett:
+        condition: service_healthy
+    environment:
+      CROWN_INDEX_LISTEN: 0.0.0.0:8080
+      CROWN_INDEX_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-crownindex-local}@postgres:5432/bitmagnet
+      CROWN_INDEX_BITMAGNET_URL: http://bitmagnet:3333/
+      CROWN_INDEX_JACKETT_URL: http://jackett:9117/
+      CROWN_INDEX_JACKETT_INDEXERS: ${CROWN_INDEX_JACKETT_INDEXERS:-1337x,audiobookbay,yts,thepiratebay,eztv,dontorrent,nyaasi,sktorrent,polskie-torrenty}
+      CROWN_INDEX_JACKETT_POLL_SECONDS: ${CROWN_INDEX_JACKETT_POLL_SECONDS:-1800}
+      CROWN_INDEX_JACKETT_TIMEOUT_SECONDS: ${CROWN_INDEX_JACKETT_TIMEOUT_SECONDS:-300}
+      CROWN_INDEX_TMDB_BATCH_SIZE: ${CROWN_INDEX_TMDB_BATCH_SIZE:-100}
+      CROWN_INDEX_TMDB_LANGUAGE: ${CROWN_INDEX_TMDB_LANGUAGE:-en-US}
+      CROWN_INDEX_TMDB_POLL_SECONDS: ${CROWN_INDEX_TMDB_POLL_SECONDS:-900}
+      CROWN_INDEX_TMDB_TIMEOUT_SECONDS: ${CROWN_INDEX_TMDB_TIMEOUT_SECONDS:-30}
+      JACKETT_API_KEY: ${JACKETT_API_KEY:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      TMDB_ENABLED: ${TMDB_ENABLED:-false}
+      RUST_LOG: ${RUST_LOG:-crown_index=info,tower_http=info}
+    ports:
+      - "127.0.0.1:${CROWN_INDEX_HOST_PORT:-8080}:8080"
+
+  backfill:
+    profiles: ["backfill"]
+    build:
+      context: .
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitmagnet:
+        condition: service_healthy
+      jackett:
+        condition: service_healthy
+    command:
+      - backfill-jackett
+    environment:
+      CROWN_INDEX_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-crownindex-local}@postgres:5432/bitmagnet
+      CROWN_INDEX_BITMAGNET_URL: http://bitmagnet:3333/
+      CROWN_INDEX_JACKETT_URL: http://jackett:9117/
+      CROWN_INDEX_JACKETT_INDEXERS: ${CROWN_INDEX_JACKETT_INDEXERS:-1337x,audiobookbay,yts,thepiratebay,eztv,dontorrent,nyaasi,sktorrent,polskie-torrenty}
+      CROWN_INDEX_JACKETT_POLL_SECONDS: ${CROWN_INDEX_JACKETT_POLL_SECONDS:-1800}
+      CROWN_INDEX_JACKETT_TIMEOUT_SECONDS: ${CROWN_INDEX_JACKETT_TIMEOUT_SECONDS:-300}
+      CROWN_INDEX_BACKFILL_INDEXERS: ${CROWN_INDEX_BACKFILL_INDEXERS:-yts,nyaasi,eztv,thepiratebay}
+      CROWN_INDEX_BACKFILL_MIN_YEAR: ${CROWN_INDEX_BACKFILL_MIN_YEAR:-1900}
+      CROWN_INDEX_BACKFILL_RESULT_LIMIT: ${CROWN_INDEX_BACKFILL_RESULT_LIMIT:-1000}
+      CROWN_INDEX_BACKFILL_DELAY_SECONDS: ${CROWN_INDEX_BACKFILL_DELAY_SECONDS:-60}
+      CROWN_INDEX_TMDB_BATCH_SIZE: ${CROWN_INDEX_TMDB_BATCH_SIZE:-100}
+      CROWN_INDEX_TMDB_LANGUAGE: ${CROWN_INDEX_TMDB_LANGUAGE:-en-US}
+      CROWN_INDEX_TMDB_POLL_SECONDS: ${CROWN_INDEX_TMDB_POLL_SECONDS:-900}
+      CROWN_INDEX_TMDB_TIMEOUT_SECONDS: ${CROWN_INDEX_TMDB_TIMEOUT_SECONDS:-30}
+      JACKETT_API_KEY: ${JACKETT_API_KEY:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      TMDB_ENABLED: ${TMDB_ENABLED:-false}
+      RUST_LOG: ${RUST_LOG:-crown_index=info}
+
+  butter-backfill:
+    profiles: ["backfill"]
+    build:
+      context: .
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitmagnet:
+        condition: service_healthy
+    command:
+      - backfill-butter
+    environment:
+      CROWN_INDEX_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-crownindex-local}@postgres:5432/bitmagnet
+      CROWN_INDEX_BITMAGNET_URL: http://bitmagnet:3333/
+      CROWN_INDEX_BUTTER_URLS: ${CROWN_INDEX_BUTTER_URLS:-}
+      CROWN_INDEX_BUTTER_SOURCE_ID: ${CROWN_INDEX_BUTTER_SOURCE_ID:-redcrown-fallbacks}
+      CROWN_INDEX_BUTTER_TIMEOUT_SECONDS: ${CROWN_INDEX_BUTTER_TIMEOUT_SECONDS:-60}
+      CROWN_INDEX_BUTTER_DELAY_MILLIS: ${CROWN_INDEX_BUTTER_DELAY_MILLIS:-500}
+      RUST_LOG: ${RUST_LOG:-crown_index=info}
+
+volumes:
+  jackett-config:
+  postgres-data:

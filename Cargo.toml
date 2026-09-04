@@ -1,0 +1,64 @@
+[package]
+name = "crown-index"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Local BitTorrent metadata index with a Butter-compatible API"
+repository = "https://github.com/redcrownlabs/CrownIndex"
+readme = "README.md"
+keywords = ["bittorrent", "dht", "search", "self-hosted"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[dependencies]
+anyhow = "1.0.103"
+axum = "0.8.9"
+clap = { version = "4.6.2", features = ["derive", "env"] }
+data-encoding = "2.11.0"
+mimalloc = "0.1.52"
+quick-xml = "0.41.0"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+scraper = "0.27.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha1 = "0.10.7"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json", "macros"] }
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "0.6.11", features = ["catch-panic", "request-id", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+map_err_ignore = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

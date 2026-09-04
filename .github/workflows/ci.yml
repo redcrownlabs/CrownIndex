@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: docker compose config --quiet
+      - run: docker build --tag crown-index:ci .
+
+  bitmagnet-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the pinned Bitmagnet database
+        run: docker compose up --detach --wait postgres bitmagnet
+      - name: Run schema compatibility tests
+        run: |
+          docker run --rm \
+            --network crown-index_default \
+            --env CARGO_TARGET_DIR=/target \
+            --env CROWN_INDEX_TEST_DATABASE_URL=postgres://postgres:crownindex-local@postgres:5432/bitmagnet \
+            --volume "$PWD:/work" \
+            --volume crown-index-test-target:/target \
+            --workdir /work \
+            rust:1.88-bookworm \
+            cargo test --locked --all-targets -- --ignored --test-threads=1
+      - if: always()
+        run: docker compose logs --no-color postgres bitmagnet
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Verify the lock-only RSA advisory remains unreachable
+        run: |
+          if cargo tree --target all --invert rsa 2>/dev/null | grep -q '^rsa v'; then
+            echo 'rsa became reachable; remove the audit exception and update dependencies.' >&2
+            exit 1
+          fi
+      - name: Audit reachable dependencies
+        run: cargo audit --ignore RUSTSEC-2023-0071
