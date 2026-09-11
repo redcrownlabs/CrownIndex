@@ -114,6 +114,28 @@ Change `CROWN_INDEX_JACKETT_INDEXERS` or
 interval is 60 seconds. `CROWN_INDEX_JACKETT_TIMEOUT_SECONDS` accepts 30–600
 seconds.
 
+## Targeted sync portal
+
+Open `http://127.0.0.1:8080/operator/` to request a focused refresh without
+waiting for the periodic poll. Enter a tracker search such as
+`Dark Matter S02`, keep all healthy indexers selected, and choose **Search and
+sync**. Each request becomes a PostgreSQL-backed job, so its source-level
+progress and result survive a page refresh or CrownIndex restart.
+
+The job uses the normal ingestion path: Jackett performs each tracker search,
+CrownIndex validates and deduplicates the observations, Bitmagnet accepts new
+records, optional TMDB enrichment correlates materialized hashes, and
+CrownIndex publishes a fresh additive catalog snapshot. Existing source
+associations are retained. A `partial` result identifies failed sources,
+deferred metadata downloads, or a source that filled the 1,000-result safety
+bound; it must not be read as a complete tracker export.
+
+The compose file publishes CrownIndex only on loopback. If you intentionally
+expose it through a reverse proxy or another host interface, set a long random
+`CROWN_INDEX_OPERATOR_TOKEN` in `.env`. The portal keeps this token only in the
+current browser tab and sends it as a bearer token. The Butter-compatible read
+routes remain unauthenticated.
+
 ## Historical backfill
 
 The regular worker intentionally reads recent releases. Historical ingestion

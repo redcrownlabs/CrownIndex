@@ -28,6 +28,11 @@ const MAX_NEW_TORRENT_RESOLUTIONS_PER_HOUR: i32 = 50;
 // launching all tracker requests at once while preserving a quick poll cycle.
 const INDEXER_REQUEST_DELAY: Duration = Duration::from_secs(1);
 const TORRENT_REQUEST_DELAY: Duration = Duration::from_millis(100);
+/// Interactive searches must fail fast enough for actionable portal feedback.
+///
+/// Periodic and historical workers retain the operator-configured timeout;
+/// only an explicitly requested search uses this lower latency boundary.
+const TARGETED_SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub(crate) struct FetchBatch {
@@ -44,10 +49,11 @@ pub(crate) struct FetchPage {
     pub(crate) fingerprint: [u8; 32],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum FeedQuery {
     Recent,
     Year { year: i32, limit: u16 },
+    Search { query: String, limit: u16 },
 }
 
 #[derive(Debug)]
@@ -115,23 +121,32 @@ impl Jackett {
             .await
     }
 
+    /// Searches one configured indexer without changing its periodic poll state.
+    pub(crate) async fn fetch_search(
+        &self,
+        indexer: &str,
+        query: &str,
+        limit: u16,
+    ) -> Result<FetchPage> {
+        self.fetch_query(
+            indexer,
+            FeedQuery::Search {
+                query: query.to_owned(),
+                limit,
+            },
+        )
+        .await
+    }
+
     async fn fetch_query(&self, indexer: &str, query: FeedQuery) -> Result<FetchPage> {
-        let mut endpoint = self
-            .config
-            .base_url
-            .join(&format!("api/v2.0/indexers/{indexer}/results/torznab/api"))
-            .context("failed to construct Jackett Torznab URL")?;
-        endpoint
-            .query_pairs_mut()
-            .append_pair("apikey", self.config.api_key.expose())
-            .append_pair("t", "search");
-        if let FeedQuery::Year { year, limit } = query {
-            endpoint
-                .query_pairs_mut()
-                .append_pair("q", &year.to_string())
-                .append_pair("limit", &limit.to_string());
-        }
-        let response = self.client.get(endpoint).send().await.map_err(|error| {
+        let endpoint = self.query_endpoint(indexer, &query)?;
+        let request = self.client.get(endpoint);
+        let request = if matches!(&query, FeedQuery::Search { .. }) {
+            request.timeout(TARGETED_SEARCH_TIMEOUT)
+        } else {
+            request
+        };
+        let response = request.send().await.map_err(|error| {
             anyhow::anyhow!(
                 "Jackett transport failed (status available: {})",
                 error.status().is_some()
@@ -211,6 +226,37 @@ impl Jackett {
             deferred,
             fingerprint,
         })
+    }
+
+    fn query_endpoint(&self, indexer: &str, query: &FeedQuery) -> Result<Url> {
+        let mut endpoint = self
+            .config
+            .base_url
+            .join(&format!("api/v2.0/indexers/{indexer}/results/torznab/api"))
+            .context("failed to construct Jackett Torznab URL")?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("apikey", self.config.api_key.expose())
+            .append_pair("t", "search");
+        match query {
+            FeedQuery::Recent => {}
+            FeedQuery::Year { year, limit } => {
+                let year = year.to_string();
+                let limit = limit.to_string();
+                endpoint
+                    .query_pairs_mut()
+                    .append_pair("q", &year)
+                    .append_pair("limit", &limit);
+            }
+            FeedQuery::Search { query, limit } => {
+                let limit = limit.to_string();
+                endpoint
+                    .query_pairs_mut()
+                    .append_pair("q", query)
+                    .append_pair("limit", &limit);
+            }
+        }
+        Ok(endpoint)
     }
 
     async fn resolve_torrent(

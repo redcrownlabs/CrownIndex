@@ -121,6 +121,49 @@ pub(crate) struct PendingEnrichment {
     pub(crate) external_id: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub(crate) struct OperatorSyncJob {
+    pub(crate) id: i64,
+    pub(crate) query: String,
+    pub(crate) requested_indexers: Vec<String>,
+    pub(crate) status: String,
+    pub(crate) phase: String,
+    pub(crate) fetched: i32,
+    pub(crate) imported: i32,
+    pub(crate) skipped: i32,
+    pub(crate) deferred: i32,
+    pub(crate) saturated_sources: i32,
+    pub(crate) matched: i32,
+    pub(crate) rejected: i32,
+    pub(crate) enrichment_pending: i32,
+    pub(crate) failed: i32,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub(crate) struct OperatorSyncSource {
+    pub(crate) indexer: String,
+    pub(crate) status: String,
+    pub(crate) fetched: i32,
+    pub(crate) imported: i32,
+    pub(crate) skipped: i32,
+    pub(crate) deferred: i32,
+    pub(crate) saturated: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct OperatorSyncJobDetail {
+    #[serde(flatten)]
+    pub(crate) job: OperatorSyncJob,
+    pub(crate) sources: Vec<OperatorSyncSource>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogStore {
     pool: PgPool,
@@ -700,6 +743,154 @@ async fn migrate_pending_butter_episode_files(
     Ok(())
 }
 
+async fn ensure_tmdb_enrichment_schema(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS crown_index.tmdb_enrichment_attempts (
+            info_hash bytea PRIMARY KEY CHECK (octet_length(info_hash) = 20),
+            torrent_name text NOT NULL,
+            parsed_title text NULL,
+            parsed_kind text NULL,
+            parsed_year integer NULL,
+            status text NOT NULL,
+            error text NULL,
+            content_type text NULL,
+            content_source text NULL,
+            content_id text NULL,
+            attempted_at timestamptz NOT NULL DEFAULT now(),
+            matched_at timestamptz NULL
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create TMDB enrichment attempts table")?;
+    Ok(())
+}
+
+async fn ensure_operator_phase_constraint(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "DO $migration$
+         BEGIN
+           IF NOT EXISTS (
+             SELECT 1 FROM pg_constraint
+             WHERE conname = 'operator_sync_jobs_phase_check'
+               AND conrelid = 'crown_index.operator_sync_jobs'::regclass
+           ) THEN
+             ALTER TABLE crown_index.operator_sync_jobs
+             ADD CONSTRAINT operator_sync_jobs_phase_check CHECK (
+               phase IN ('queued', 'searching', 'enriching', 'publishing', 'completed')
+             );
+           END IF;
+         END
+         $migration$",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to constrain operator sync phases")?;
+    Ok(())
+}
+
+async fn ensure_operator_sync_schema(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS crown_index.operator_sync_jobs (
+            id bigserial PRIMARY KEY,
+            query text NOT NULL CHECK (char_length(query) BETWEEN 3 AND 200),
+            requested_indexers text[] NOT NULL CHECK (
+                cardinality(requested_indexers) BETWEEN 1 AND 100
+            ),
+            status text NOT NULL DEFAULT 'queued' CHECK (
+                status IN ('queued', 'running', 'completed', 'partial', 'failed')
+            ),
+            phase text NOT NULL DEFAULT 'queued' CHECK (
+                phase IN ('queued', 'searching', 'enriching', 'publishing', 'completed')
+            ),
+            fetched integer NOT NULL DEFAULT 0 CHECK (fetched >= 0),
+            imported integer NOT NULL DEFAULT 0 CHECK (imported >= 0),
+            skipped integer NOT NULL DEFAULT 0 CHECK (skipped >= 0),
+            deferred integer NOT NULL DEFAULT 0 CHECK (deferred >= 0),
+            saturated_sources integer NOT NULL DEFAULT 0 CHECK (saturated_sources >= 0),
+            matched integer NOT NULL DEFAULT 0 CHECK (matched >= 0),
+            rejected integer NOT NULL DEFAULT 0 CHECK (rejected >= 0),
+            enrichment_pending integer NOT NULL DEFAULT 0 CHECK (enrichment_pending >= 0),
+            failed integer NOT NULL DEFAULT 0 CHECK (failed >= 0),
+            error text NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            started_at timestamptz NULL,
+            finished_at timestamptz NULL
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create operator sync job table")?;
+    for statement in [
+        "ALTER TABLE crown_index.operator_sync_jobs
+         ADD COLUMN IF NOT EXISTS phase text NOT NULL DEFAULT 'queued'",
+        "ALTER TABLE crown_index.operator_sync_jobs
+         ADD COLUMN IF NOT EXISTS enrichment_pending integer NOT NULL DEFAULT 0
+             CHECK (enrichment_pending >= 0)",
+        "ALTER TABLE crown_index.operator_sync_jobs
+         ADD COLUMN IF NOT EXISTS saturated_sources integer NOT NULL DEFAULT 0
+             CHECK (saturated_sources >= 0)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to migrate operator sync job progress")?;
+    }
+    sqlx::query(
+        "UPDATE crown_index.operator_sync_jobs
+         SET phase = CASE
+             WHEN status IN ('completed', 'partial', 'failed') THEN 'completed'
+             WHEN status = 'running' THEN 'searching'
+             ELSE 'queued'
+         END
+         WHERE phase = 'queued' AND status <> 'queued'",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to backfill operator sync phases")?;
+    ensure_operator_phase_constraint(transaction).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS operator_sync_jobs_queue_idx
+         ON crown_index.operator_sync_jobs (id)
+         WHERE status = 'queued'",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to index queued operator sync jobs")?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS crown_index.operator_sync_sources (
+            job_id bigint NOT NULL REFERENCES crown_index.operator_sync_jobs(id)
+                ON DELETE CASCADE,
+            indexer text NOT NULL,
+            status text NOT NULL DEFAULT 'queued' CHECK (
+                status IN ('queued', 'searching', 'importing', 'completed', 'failed')
+            ),
+            fetched integer NOT NULL DEFAULT 0 CHECK (fetched >= 0),
+            imported integer NOT NULL DEFAULT 0 CHECK (imported >= 0),
+            skipped integer NOT NULL DEFAULT 0 CHECK (skipped >= 0),
+            deferred integer NOT NULL DEFAULT 0 CHECK (deferred >= 0),
+            saturated boolean NOT NULL DEFAULT false,
+            error text NULL,
+            started_at timestamptz NULL,
+            finished_at timestamptz NULL,
+            PRIMARY KEY (job_id, indexer)
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create operator sync source table")?;
+    sqlx::query(
+        "ALTER TABLE crown_index.operator_sync_sources
+         ADD COLUMN IF NOT EXISTS saturated boolean NOT NULL DEFAULT false",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to migrate operator sync source saturation state")?;
+    Ok(())
+}
+
 impl CatalogStore {
     pub(crate) async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -773,25 +964,8 @@ impl CatalogStore {
         .execute(&mut *transaction)
         .await
         .context("failed to create Jackett backfill state table")?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS crown_index.tmdb_enrichment_attempts (
-                info_hash bytea PRIMARY KEY CHECK (octet_length(info_hash) = 20),
-                torrent_name text NOT NULL,
-                parsed_title text NULL,
-                parsed_kind text NULL,
-                parsed_year integer NULL,
-                status text NOT NULL,
-                error text NULL,
-                content_type text NULL,
-                content_source text NULL,
-                content_id text NULL,
-                attempted_at timestamptz NOT NULL DEFAULT now(),
-                matched_at timestamptz NULL
-             )",
-        )
-        .execute(&mut *transaction)
-        .await
-        .context("failed to create TMDB enrichment attempts table")?;
+        ensure_tmdb_enrichment_schema(&mut transaction).await?;
+        ensure_operator_sync_schema(&mut transaction).await?;
         ensure_content_correlation_schema(&mut transaction).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS crown_index.butter_backfill_state (
@@ -849,6 +1023,281 @@ impl CatalogStore {
             .filter(|record| !existing.contains(&(record.source.clone(), record.info_hash.clone())))
             .cloned()
             .collect())
+    }
+
+    pub(crate) async fn enqueue_operator_sync(
+        &self,
+        query: &str,
+        indexers: &[String],
+    ) -> Result<OperatorSyncJob> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin operator sync transaction")?;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO crown_index.operator_sync_jobs (query, requested_indexers)
+             VALUES ($1, $2)
+             RETURNING id",
+        )
+        .bind(query)
+        .bind(indexers)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("failed to enqueue operator sync")?;
+        let mut sources = QueryBuilder::<Postgres>::new(
+            "INSERT INTO crown_index.operator_sync_sources (job_id, indexer) ",
+        );
+        sources.push_values(indexers, |mut row, indexer| {
+            row.push_bind(id).push_bind(indexer);
+        });
+        sources
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .context("failed to initialize operator sync sources")?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit operator sync transaction")?;
+        self.operator_sync_job(id)
+            .await?
+            .map(|detail| detail.job)
+            .context("new operator sync job disappeared")
+    }
+
+    pub(crate) async fn requeue_interrupted_operator_syncs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "WITH interrupted AS (
+                UPDATE crown_index.operator_sync_jobs
+                SET status = 'queued', phase = 'queued', started_at = NULL,
+                    error = 'resumed after CrownIndex restarted'
+                WHERE status = 'running'
+                RETURNING id
+             )
+             UPDATE crown_index.operator_sync_sources source
+             SET status = 'queued', started_at = NULL, finished_at = NULL,
+                 error = NULL
+             FROM interrupted
+             WHERE source.job_id = interrupted.id
+               AND source.status IN ('searching', 'importing')",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to requeue interrupted operator syncs")?;
+        Ok(result.rows_affected())
+    }
+
+    pub(crate) async fn claim_operator_sync(&self) -> Result<Option<OperatorSyncJob>> {
+        sqlx::query_as(
+            "WITH next_job AS (
+                SELECT id
+                FROM crown_index.operator_sync_jobs
+                WHERE status = 'queued'
+                ORDER BY id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+             ), claimed AS (
+                UPDATE crown_index.operator_sync_jobs job
+                SET status = 'running', phase = 'searching',
+                    started_at = now(), finished_at = NULL,
+                    error = NULL
+                FROM next_job
+                WHERE job.id = next_job.id
+                RETURNING job.*
+             )
+             SELECT id, query, requested_indexers, status, phase,
+                    fetched, imported, skipped, deferred, saturated_sources, matched, rejected,
+                    enrichment_pending, failed,
+                    error,
+                    EXTRACT(EPOCH FROM created_at)::bigint AS created_at,
+                    EXTRACT(EPOCH FROM started_at)::bigint AS started_at,
+                    EXTRACT(EPOCH FROM finished_at)::bigint AS finished_at
+             FROM claimed",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to claim operator sync")
+    }
+
+    pub(crate) async fn operator_sync_source_started(
+        &self,
+        job_id: i64,
+        indexer: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_sources
+             SET status = 'searching', started_at = now(), finished_at = NULL,
+                 error = NULL
+             WHERE job_id = $1 AND indexer = $2",
+        )
+        .bind(job_id)
+        .bind(indexer)
+        .execute(&self.pool)
+        .await
+        .context("failed to start operator sync source")?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_operator_sync_phase(&self, id: i64, phase: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_jobs
+             SET phase = $2
+             WHERE id = $1 AND status = 'running'",
+        )
+        .bind(id)
+        .bind(phase)
+        .execute(&self.pool)
+        .await
+        .context("failed to update operator sync phase")?;
+        Ok(())
+    }
+
+    pub(crate) async fn operator_sync_source_importing(
+        &self,
+        job_id: i64,
+        indexer: &str,
+        fetched: i32,
+        skipped: i32,
+        deferred: i32,
+        saturated: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_sources
+             SET status = 'importing', fetched = $3, skipped = $4, deferred = $5,
+                 saturated = $6
+             WHERE job_id = $1 AND indexer = $2",
+        )
+        .bind(job_id)
+        .bind(indexer)
+        .bind(fetched)
+        .bind(skipped)
+        .bind(deferred)
+        .bind(saturated)
+        .execute(&self.pool)
+        .await
+        .context("failed to update operator sync source")?;
+        Ok(())
+    }
+
+    pub(crate) async fn finish_operator_sync_source(
+        &self,
+        job_id: i64,
+        indexer: &str,
+        imported: i32,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_sources
+             SET status = CASE WHEN $4::text IS NULL THEN 'completed' ELSE 'failed' END,
+                 imported = $3, error = $4, finished_at = now()
+             WHERE job_id = $1 AND indexer = $2",
+        )
+        .bind(job_id)
+        .bind(indexer)
+        .bind(imported)
+        .bind(error.map(truncate_operator_error))
+        .execute(&self.pool)
+        .await
+        .context("failed to finish operator sync source")?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "job totals form one persisted progress snapshot"
+    )]
+    pub(crate) async fn finish_operator_sync(
+        &self,
+        id: i64,
+        status: &str,
+        fetched: i32,
+        imported: i32,
+        skipped: i32,
+        deferred: i32,
+        saturated_sources: i32,
+        matched: i32,
+        rejected: i32,
+        enrichment_pending: i32,
+        failed: i32,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin operator sync completion")?;
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_sources
+             SET status = 'failed', error = COALESCE(error, $2), finished_at = now()
+             WHERE job_id = $1 AND status IN ('queued', 'searching', 'importing')",
+        )
+        .bind(id)
+        .bind(error.map(truncate_operator_error))
+        .execute(&mut *transaction)
+        .await
+        .context("failed to close unfinished operator sync sources")?;
+        sqlx::query(
+            "UPDATE crown_index.operator_sync_jobs
+             SET status = $2, phase = 'completed',
+                 fetched = $3, imported = $4, skipped = $5,
+                 deferred = $6, saturated_sources = $7, matched = $8, rejected = $9,
+                 enrichment_pending = $10, failed = $11,
+                 error = $12, finished_at = now()
+             WHERE id = $1 AND status = 'running'",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(fetched)
+        .bind(imported)
+        .bind(skipped)
+        .bind(deferred)
+        .bind(saturated_sources)
+        .bind(matched)
+        .bind(rejected)
+        .bind(enrichment_pending)
+        .bind(failed)
+        .bind(error.map(truncate_operator_error))
+        .execute(&mut *transaction)
+        .await
+        .context("failed to finish operator sync")?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit operator sync completion")?;
+        Ok(())
+    }
+
+    pub(crate) async fn operator_sync_jobs(&self, limit: i64) -> Result<Vec<OperatorSyncJob>> {
+        sqlx::query_as(&operator_sync_job_query("ORDER BY id DESC LIMIT $1"))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list operator sync jobs")
+    }
+
+    pub(crate) async fn operator_sync_job(&self, id: i64) -> Result<Option<OperatorSyncJobDetail>> {
+        let job = sqlx::query_as(&operator_sync_job_query("WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("failed to read operator sync job")?;
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        let sources = sqlx::query_as(
+            "SELECT indexer, status, fetched, imported, skipped, deferred, saturated, error,
+                    EXTRACT(EPOCH FROM started_at)::bigint AS started_at,
+                    EXTRACT(EPOCH FROM finished_at)::bigint AS finished_at
+             FROM crown_index.operator_sync_sources
+             WHERE job_id = $1
+             ORDER BY indexer",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to read operator sync sources")?;
+        Ok(Some(OperatorSyncJobDetail { job, sources }))
     }
 
     pub(crate) async fn mark_ingested(&self, records: &[TorrentRecord]) -> Result<()> {
@@ -1610,6 +2059,31 @@ impl CatalogStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to load targeted TMDB enrichment item")
+    }
+
+    pub(crate) async fn materialized_info_hashes(
+        &self,
+        records: &[TorrentRecord],
+    ) -> Result<HashSet<String>> {
+        if records.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let hashes = records
+            .iter()
+            .map(|record| record.info_hash_bytes().map(|hash| hash.to_vec()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT encode(info_hash, 'hex') FROM torrents WHERE false",
+        );
+        for hash in hashes {
+            query.push(" OR info_hash = ").push_bind(hash);
+        }
+        query
+            .build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map(|values| values.into_iter().collect())
+            .context("failed to inspect Bitmagnet import materialization")
     }
 
     pub(crate) async fn record_tmdb_enrichment_failure(
@@ -2374,6 +2848,24 @@ fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
         anyhow::bail!("info hash is not 20 bytes");
     }
     Ok(bytes)
+}
+
+fn operator_sync_job_query(suffix: &str) -> String {
+    format!(
+        "SELECT id, query, requested_indexers, status, phase,
+                fetched, imported, skipped, deferred, saturated_sources, matched, rejected,
+                enrichment_pending, failed,
+                error,
+                EXTRACT(EPOCH FROM created_at)::bigint AS created_at,
+                EXTRACT(EPOCH FROM started_at)::bigint AS started_at,
+                EXTRACT(EPOCH FROM finished_at)::bigint AS finished_at
+         FROM crown_index.operator_sync_jobs {suffix}"
+    )
+}
+
+fn truncate_operator_error(error: &str) -> String {
+    // Error rows are diagnostic summaries, not an unbounded upstream log sink.
+    error.chars().take(1_000).collect()
 }
 
 #[cfg(test)]

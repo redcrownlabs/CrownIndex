@@ -108,6 +108,10 @@ the compatibility query and tests together.
   A failed refresh leaves the previous generation active.
 - The host API port is configurable because loopback ports are shared with
   unrelated local applications; the container always listens on port 8080.
+- Operator-requested searches are durable PostgreSQL jobs and reuse the normal
+  Jackett, Bitmagnet, enrichment, and snapshot path. Source failures,
+  resolution deferrals, and result saturation remain visible instead of being
+  reported as complete. See `docs/operator-sync.md`.
 - TMDB batch work performs one availability request before selecting rows.
   Transport failures are retried after a bounded delay, while unparseable and
   conservatively rejected titles remain terminal. This prevents a network-wide

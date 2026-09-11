@@ -657,3 +657,83 @@ async fn pending_butter_association_preserves_large_episode_file_maps() -> Resul
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires CROWN_INDEX_TEST_DATABASE_URL pointing at Bitmagnet v0.10.0 PostgreSQL"]
+async fn operator_sync_jobs_preserve_source_progress() -> Result<()> {
+    let database_url = std::env::var("CROWN_INDEX_TEST_DATABASE_URL")
+        .context("CROWN_INDEX_TEST_DATABASE_URL is required")?;
+    let store = CatalogStore::connect(&database_url).await?;
+    let query = format!(
+        "operator durability test {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock predates Unix epoch")?
+            .as_nanos()
+    );
+    let indexers = vec!["test-a".to_owned(), "test-b".to_owned()];
+    let queued = store.enqueue_operator_sync(&query, &indexers).await?;
+    let claimed = store
+        .claim_operator_sync()
+        .await?
+        .context("queued operator job should be claimable")?;
+    assert_eq!(claimed.id, queued.id);
+    assert_eq!(claimed.status, "running");
+
+    store
+        .operator_sync_source_started(claimed.id, "test-a")
+        .await?;
+    store
+        .operator_sync_source_importing(claimed.id, "test-a", 12, 3, 1, true)
+        .await?;
+    store
+        .finish_operator_sync_source(claimed.id, "test-a", 9, None)
+        .await?;
+    store
+        .finish_operator_sync(
+            claimed.id,
+            "partial",
+            12,
+            9,
+            3,
+            1,
+            1,
+            4,
+            2,
+            3,
+            1,
+            Some("test-b unavailable"),
+        )
+        .await?;
+
+    let detail = store
+        .operator_sync_job(claimed.id)
+        .await?
+        .context("finished operator job should remain readable")?;
+    assert_eq!(detail.job.status, "partial");
+    assert_eq!(detail.job.imported, 9);
+    assert_eq!(detail.job.saturated_sources, 1);
+    assert_eq!(detail.sources.len(), 2);
+    assert_eq!(
+        detail
+            .sources
+            .iter()
+            .find(|source| source.indexer == "test-a")
+            .map(|source| (source.status.as_str(), source.saturated)),
+        Some(("completed", true))
+    );
+    assert_eq!(
+        detail
+            .sources
+            .iter()
+            .find(|source| source.indexer == "test-b")
+            .map(|source| source.status.as_str()),
+        Some("failed")
+    );
+
+    sqlx::query("DELETE FROM crown_index.operator_sync_jobs WHERE id = $1")
+        .bind(claimed.id)
+        .execute(&store.pool)
+        .await?;
+    Ok(())
+}

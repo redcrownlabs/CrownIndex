@@ -128,6 +128,7 @@ pub(crate) struct Config {
     pub(crate) jackett: Option<JackettConfig>,
     pub(crate) butter: Option<ButterConfig>,
     pub(crate) tmdb: Option<TmdbConfig>,
+    pub(crate) operator_token: Option<Secret>,
 }
 
 impl Config {
@@ -154,6 +155,11 @@ impl Config {
         let jackett = jackett_config()?;
         let butter = butter_config()?;
         let tmdb = tmdb_config()?;
+        let operator_token = env::var("CROWN_INDEX_OPERATOR_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(Secret);
         Ok(Self {
             listen,
             database_url,
@@ -163,6 +169,7 @@ impl Config {
             jackett,
             butter,
             tmdb,
+            operator_token,
         })
     }
 }

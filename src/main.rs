@@ -9,6 +9,8 @@ mod ext;
 mod importer;
 mod media_match;
 mod model;
+mod operator;
+mod operator_web;
 mod record;
 mod store;
 mod tmdb;
@@ -181,6 +183,23 @@ async fn serve(config: &Config) -> Result<()> {
             shutdown_rx.clone(),
         ))
     });
+    let operator_worker = if let Some(jackett_config) = config.jackett.clone() {
+        let tmdb = config
+            .tmdb
+            .clone()
+            .filter(|tmdb| tmdb.enabled)
+            .map(Tmdb::new)
+            .transpose()?;
+        Some(tokio::spawn(operator::run_worker(
+            store.clone(),
+            config.bitmagnet_url.clone(),
+            Jackett::new(jackett_config, store.clone())?,
+            tmdb,
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
     let tmdb_worker = config
         .tmdb
         .clone()
@@ -196,7 +215,17 @@ async fn serve(config: &Config) -> Result<()> {
     ));
     let signal = tokio::spawn(signal_shutdown(shutdown_tx.clone()));
     event!(Level::INFO, server.address = %config.listen, "CrownIndex API listening: {{server.address}}");
-    let server_result = axum::serve(listener, api::router(store))
+    let operator_indexers = config
+        .jackett
+        .as_ref()
+        .map(|jackett| jackett.indexers.clone())
+        .unwrap_or_default();
+    let app = api::router(store.clone()).merge(operator_web::router(
+        store,
+        operator_indexers,
+        config.operator_token.clone(),
+    ));
+    let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
         .await
         .context("HTTP server failed");
@@ -207,6 +236,9 @@ async fn serve(config: &Config) -> Result<()> {
     }
     if let Some(worker) = tmdb_worker {
         worker.await.context("TMDB worker task failed")??;
+    }
+    if let Some(worker) = operator_worker {
+        worker.await.context("operator sync worker task failed")??;
     }
     reconciliation_worker
         .await
